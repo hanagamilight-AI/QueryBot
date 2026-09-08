@@ -10,35 +10,21 @@ venv/
 .venv/
 .ENV
 .ENV.local
-.python-version
-.python-history
-.pytest_cache/
-.mypy_cache/
-.coverage
-htmlcov/
-coverage/
-
-# Environment
 .env
 .env.local
 .env.*
-
-# Logs
+.venv.bak
+pip-log.txt
+pip-delete-this-directory.txt
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
 *.log
-
-# Temporary files
-*.tmp
-*.swp
-*.swo
-
-# OS generated files
+.git/modules/
 .DS_Store
 Thumbs.db
-
-# Editors
-.vscode/
-.idea/
-```node_modules/
-.next/
-dist/
-build/
+```
