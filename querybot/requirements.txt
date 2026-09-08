@@ -40,3 +40,10 @@ pyyaml==6.0.1
 # Testing
 pytest==7.4.4
 pytest-asyncio==0.23.3
+
+# Observability (optional)
+langfuse>=2.0.0
+langsmith>=0.1.0
+
+# Model providers (optional)
+# openrouter  # Available via httpx

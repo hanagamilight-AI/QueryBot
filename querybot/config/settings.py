@@ -24,9 +24,10 @@ class Settings(BaseSettings):
     CHUNK_OVERLAP: int = 50
     
     # LLM Configuration
-    LLM_PROVIDER: str = "openai"  # or "local", "anthropic"
+    LLM_PROVIDER: str = "openrouter"  # or "local", "openai", "anthropic"
     OPENAI_API_KEY: Optional[str] = None
-    LLM_MODEL: str = "gpt-4-turbo-preview"
+    OPENROUTER_API_KEY: Optional[str] = None
+    LLM_MODEL: str = "meta-llama/llama-3-70b-instruct"
     LLM_TEMPERATURE: float = 0.7
     MAX_TOKENS: int = 2048
     
@@ -50,6 +51,17 @@ class Settings(BaseSettings):
     AWS_REGION: Optional[str] = None
     AWS_ACCESS_KEY: Optional[str] = None
     AWS_SECRET_KEY: Optional[str] = None
+    
+    # Observability
+    LANGFUSE_PUBLIC_KEY: Optional[str] = None
+    LANGFUSE_SECRET_KEY: Optional[str] = None
+    LANGFUSE_HOST: Optional[str] = "https://cloud.langfuse.com"
+    LANGCHAIN_API_KEY: Optional[str] = None
+    LANGCHAIN_PROJECT: str = "querybot"
+    
+    # Guardrails
+    GUARDRAILS_STRICT_MODE: bool = True
+    GUARDRAILS_AUTO_CONFIRM_LOW_RISK: bool = True
     
     class Config:
         env_file = ".env"
