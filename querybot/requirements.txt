@@ -45,5 +45,9 @@ pytest-asyncio==0.23.3
 langfuse>=2.0.0
 langsmith>=0.1.0
 
+# Caching & Memory
+redis>=5.0.0
+hiredis>=3.0.0
+
 # Model providers (optional)
 # openrouter  # Available via httpx

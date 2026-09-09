@@ -63,6 +63,12 @@ class Settings(BaseSettings):
     GUARDRAILS_STRICT_MODE: bool = True
     GUARDRAILS_AUTO_CONFIRM_LOW_RISK: bool = True
     
+    # Redis Cache
+    REDIS_URL: str = "redis://localhost:6379/0"
+    CACHE_TTL_DEFAULT: int = 3600
+    CACHE_SIMILARITY_THRESHOLD: float = 0.85
+    CACHE_ENABLED: bool = True
+    
     class Config:
         env_file = ".env"
         case_sensitive = True
