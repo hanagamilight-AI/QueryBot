@@ -12,6 +12,8 @@ from langgraph.checkpoint.memory import MemorySaver
 
 from tools.mcp_tools import MCP_TOOLS, get_tool, ToolResult
 from config.settings import settings
+from cache.hybrid_cache import get_cache, CacheNamespace
+from embeddings.embedder import get_embedder
 
 
 # ============================================================================
@@ -137,8 +139,42 @@ def retrieval_node(state: AgentState) -> Dict[str, Any]:
     - Performs semantic search via pgvector
     - Executes structured database queries
     - Aggregates results from multiple sources
+    - Checks cache first for faster responses
     """
     logger.info("Executing retrieval strategies")
+    
+    # Check cache first if enabled
+    if settings.CACHE_ENABLED:
+        try:
+            cache = get_cache(similarity_threshold=settings.CACHE_SIMILARITY_THRESHOLD)
+            
+            # Generate embedding for semantic cache lookup
+            embedder = get_embedder()
+            query_vector = embedder.embed_query(state['query'])
+            
+            # Try to get cached response
+            cache_hit = cache.get(
+                query=state['query'],
+                parameters=state.get('query_entities', {}),
+                namespace=CacheNamespace.QUERY_RESPONSE,
+                query_vector=query_vector
+            )
+            
+            if cache_hit:
+                logger.info(f"Cache HIT ({cache_hit.hit_type}) - similarity: {cache_hit.similarity_score}")
+                
+                # Return cached response directly
+                return {
+                    "retrieved_documents": cache_hit.entry.value.get('documents', []),
+                    "tool_results": [],
+                    "reasoning_steps": [f"Response retrieved from cache ({cache_hit.hit_type} match)",
+                                       f"Cache retrieval time: {cache_hit.retrieval_time_ms:.2f}ms"],
+                    "from_cache": True,
+                    "cached_response": cache_hit.entry.value.get('response'),
+                    "updated_at": datetime.utcnow()
+                }
+        except Exception as e:
+            logger.warning(f"Cache lookup failed, proceeding with normal retrieval: {e}")
     
     retrieved_docs = []
     tool_results = []
@@ -211,6 +247,7 @@ def retrieval_node(state: AgentState) -> Dict[str, Any]:
         "retrieved_documents": unique_docs[:15],  # Limit context
         "tool_results": tool_results,
         "reasoning_steps": reasoning,
+        "from_cache": False,
         "updated_at": datetime.utcnow()
     }
 
@@ -224,8 +261,20 @@ def synthesis_node(state: AgentState) -> Dict[str, Any]:
     - Identifies key insights and patterns
     - Generates natural language response
     - Cites sources appropriately
+    - Caches the response for future use
     """
     logger.info("Synthesizing response from retrieved information")
+    
+    # Check if we have a cached response from retrieval
+    if state.get('from_cache') and state.get('cached_response'):
+        logger.info("Using cached response from retrieval node")
+        return {
+            "response": state['cached_response'],
+            "confidence_score": 0.95,  # High confidence for cached responses
+            "reasoning_steps": state.get('reasoning_steps', []) + ["Response served from cache"],
+            "from_cache": True,
+            "updated_at": datetime.utcnow()
+        }
     
     docs = state.get('retrieved_documents', [])
     query = state['query']
@@ -260,12 +309,42 @@ def synthesis_node(state: AgentState) -> Dict[str, Any]:
         sources = _extract_sources(docs)
         response += "\n\n**Sources:**\n" + "\n".join(sources[:5])
     
-    return {
+    result = {
         "response": response,
         "confidence_score": confidence,
         "reasoning_steps": reasoning,
+        "from_cache": False,
         "updated_at": datetime.utcnow()
     }
+    
+    # Cache the response if not from cache and cache is enabled
+    if not state.get('from_cache') and settings.CACHE_ENABLED:
+        try:
+            cache = get_cache(similarity_threshold=settings.CACHE_SIMILARITY_THRESHOLD)
+            embedder = get_embedder()
+            query_vector = embedder.embed_query(query)
+            
+            # Store response with documents
+            cache_value = {
+                "response": response,
+                "documents": docs,
+                "confidence": confidence,
+                "intent": intent
+            }
+            
+            cache.set(
+                query=query,
+                value=cache_value,
+                parameters=state.get('query_entities', {}),
+                namespace=CacheNamespace.QUERY_RESPONSE,
+                ttl=settings.CACHE_TTL_DEFAULT,
+                query_vector=query_vector
+            )
+            reasoning.append("Response cached for future queries")
+        except Exception as e:
+            logger.warning(f"Failed to cache response: {e}")
+    
+    return result
 
 
 def _generate_factual_response(query: str, docs: List[Dict]) -> tuple:
