@@ -599,7 +599,166 @@ print(f"Category Breakdown: {report.category_scores}")
 
 ---
 
-## Query Flow Examples
+## MCP (Model Context Protocol) Architecture
+
+### Overview
+MCP standardizes how agents interact with external data sources and tools, transforming hardcoded pipeline steps into **autonomous tool-calling capabilities**.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Agent (LangGraph)                            │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐          │
+│  │   Query      │  │  Retrieval   │  │  Synthesis   │          │
+│  │   Analysis   │──│    Agent     │──│    Agent     │          │
+│  └──────────────┘  └──────────────┘  └──────────────┘          │
+│         │                  │                                    │
+│         └──────────────────┼────────────────────────────────────┤
+│                            │ MCP Protocol Layer                 │
+└────────────────────────────┼────────────────────────────────────┘
+                             │
+        ┌────────────────────┼────────────────────┐
+        │                    │                    │
+        ▼                    ▼                    ▼
+┌───────────────┐   ┌───────────────┐   ┌───────────────┐
+│   Database    │   │   Vector      │   │  External     │
+│     Tool      │   │  Retriever    │   │    API        │
+│               │   │     Tool      │   │    Tool       │
+│ • SQL queries │   │ • Embedding   │   │ • News API    │
+│ • Filtering   │   │ • Similarity  │   │ • Twitter API │
+│ • Aggregation │   │ • Re-ranking  │   │ • Reddit API  │
+└───────────────┘   └───────────────┘   └───────────────┘
+        │                    │                    │
+        ▼                    ▼                    ▼
+┌─────────────────────────────────────────────────────────────────┐
+│              PostgreSQL + pgvector + External APIs              │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### How MCP Enables Multi-Source Data Access
+
+#### 1. **Standardized Tool Interface**
+All data sources implement the same `ToolResult` interface:
+
+```python
+class ToolResult(BaseModel):
+    success: bool
+    data: Any = None
+    error: Optional[str] = None
+    metadata: Dict[str, Any]
+```
+
+This means the Retrieval Agent can call **any tool** without knowing implementation details.
+
+#### 2. **Tool Abstraction Example**
+
+**Without MCP (Hardcoded):**
+```python
+# Agent needs to know SQL, vector math, API endpoints
+def get_data(query, constituency):
+    # SQL query
+    results = session.query(Document).filter(
+        Document.constituency == constituency
+    ).all()
+    
+    # Vector search
+    embedding = embed(query)
+    similar = cosine_similarity(embedding, all_embeddings)
+    
+    # API call
+    response = requests.get(f"https://newsapi.com?q={query}")
+    
+    return combine(results, similar, response.json())
+```
+
+**With MCP (Agent-Friendly):**
+```python
+# Agent just calls tools declaratively
+vector_tool = get_tool("vector_search")
+db_tool = get_tool("database_query")
+api_tool = get_tool("external_api")
+
+# All return same ToolResult format
+vector_result = vector_tool.execute(query=query, filters={"constituency": "Patna"})
+db_result = db_tool.execute(query_type="elections", filters={"constituency": "Patna"})
+news_result = api_tool.execute(api_type="news", query=query, location="Bihar")
+
+# Agent processes uniform results
+all_data = [r.data for r in [vector_result, db_result, news_result] if r.success]
+```
+
+#### 3. **Available MCP Tools**
+
+| Tool Name | Purpose | Data Source | Parameters |
+|-----------|---------|-------------|------------|
+| `database_query` | Structured SQL queries | PostgreSQL | query_type, filters, limit |
+| `vector_search` | Semantic similarity search | pgvector | query, filters, min_similarity |
+| `external_api` | Real-time data fetch | News/Twitter/Reddit APIs | api_type, query, location |
+| `conversation_memory` | Session history | PostgreSQL | action, session_id |
+
+#### 4. **Retrieval Agent Workflow with MCP**
+
+```
+Step 1: Query Analysis
+└─> Determines: intent="comparative", entities={party: "BJP", state: "Bihar"}
+
+Step 2: Tool Selection (Autonomous)
+├─> Intent is "comparative" → Need structured data + semantic context
+├─> Select tools: [vector_search, database_query]
+└─> Skip external_api (not recent query)
+
+Step 3: Parallel Tool Execution
+├─> vector_search.execute(query="BJP Bihar manifesto", filters={party: "BJP"})
+│   └─> Returns: 10 similar documents with similarity scores
+│
+└─> database_query.execute(query_type="manifestos", filters={party: "BJP", state: "Bihar"})
+    └─> Returns: 8 structured manifesto records
+
+Step 4: Result Aggregation
+├─> Combine vector results (semantic relevance)
+├─> Merge with DB results (structured metadata)
+└─> Deduplicate by document ID
+
+Step 5: Pass to Synthesis Agent
+└─> Retrieved documents: 15 unique docs
+    Tool results: 2 successful executions
+    Reasoning: ["Vector search returned 10 docs", "DB query returned 8 records"]
+```
+
+### Benefits of MCP Architecture
+
+| Benefit | Description |
+|---------|-------------|
+| **Modularity** | Add new data sources by implementing tool interface (no agent changes) |
+| **Autonomy** | Agents choose which tools to call based on query analysis |
+| **Testability** | Mock individual tools without affecting entire pipeline |
+| **Observability** | Track which tools were called, success rates, latency per tool |
+| **Fallback Logic** | If one tool fails, agents can try alternative tools |
+| **Rate Limiting** | Apply rate limits per tool type (guardrails integration) |
+
+### Adding a New Data Source (Example: YouTube Transcripts)
+
+```python
+class YouTubeTranscriptTool:
+    name = "youtube_transcript"
+    description = "Search and retrieve YouTube video transcripts about political events"
+    
+    def execute(self, query: str, channel: str = None) -> ToolResult:
+        try:
+            # Implementation details hidden from agent
+            transcripts = search_youtube(query, channel)
+            return ToolResult(success=True, data=transcripts)
+        except Exception as e:
+            return ToolResult(success=False, error=str(e))
+
+# Register tool
+register_tool("youtube_transcript", YouTubeTranscriptTool())
+
+# Agent can now use it automatically!
+```
+
+---
+
+## Query Flow Examples with MCP Integration
 
 ### Example 1: Factual Query Flow
 

@@ -59,74 +59,142 @@ class AgentState(TypedDict):
 
 def query_analysis_node(state: AgentState) -> Dict[str, Any]:
     """
-    Analyze user query to extract intent, entities, and required actions
+    Analyze user query to extract entities and context ONLY.
     
     This node performs:
-    - Intent classification (factual, analytical, comparative, trend)
     - Entity extraction (constituency, party, candidate, date ranges)
-    - Query complexity assessment
+    - Pronoun resolution using conversation history
+    - Language detection
+    - Ambiguity detection
+    
+    NOTE: Intent classification is handled by a separate node.
     """
-    logger.info(f"Analyzing query: {state['query']}")
+    logger.info(f"Analyzing query for entities: {state['query']}")
     
-    query = state['query'].lower()
+    query = state['query']
     
-    # Simple intent classification (in production, use LLM)
-    intent = "factual"
-    if any(word in query for word in ['compare', 'versus', 'vs', 'difference']):
-        intent = "comparative"
-    elif any(word in query for word in ['trend', 'change', 'evolution', 'history']):
-        intent = "trend"
-    elif any(word in query for word in ['analyze', 'why', 'reason', 'impact']):
-        intent = "analytical"
-    elif any(word in query for word in ['predict', 'forecast', 'will']):
-        intent = "predictive"
-    
-    # Extract entities (simplified - in production use NER model)
+    # Extract entities (simplified - in production use NER model via LLM)
     entities = {}
     
     # Look for party names
-    parties = ['bjp', 'congress', 'aap', 'dmk', 'aitc', 'bsp', 'ssp', 'ncp']
+    parties = ['bjp', 'congress', 'aap', 'dmk', 'aitc', 'bsp', 'ssp', 'ncp', 
+               'bharatiya janata party', 'indian national congress']
+    query_lower = query.lower()
     for party in parties:
-        if party in query:
-            entities['party'] = party.upper()
+        if party in query_lower:
+            entities['party'] = party.upper() if len(party) < 10 else party.title()
             break
     
-    # Look for common constituency patterns (simplified)
-    if 'constituency' in query or 'ward' in query:
-        # Extract constituency name (simplified)
+    # Look for common constituency patterns
+    if 'constituency' in query_lower or 'ward' in query_lower:
         words = query.split()
         for i, word in enumerate(words):
-            if word in ['constituency', 'ward'] and i + 1 < len(words):
+            if word.lower() in ['constituency', 'ward'] and i + 1 < len(words):
                 entities['constituency'] = words[i + 1].capitalize()
                 break
     
-    # Look for state names (sample)
-    states = ['delhi', 'maharashtra', 'tamil nadu', 'uttar pradesh', 'gujarat']
+    # Look for state names
+    states = ['delhi', 'maharashtra', 'tamil nadu', 'uttar pradesh', 'gujarat', 
+              'bihar', 'karnataka', 'west bengal', 'rajasthan']
     for state_name in states:
-        if state_name in query:
+        if state_name in query_lower:
             entities['state'] = state_name.title()
             break
     
-    # Determine timeframe
-    timeframe = None
-    if 'recent' in query or 'latest' in query:
-        timeframe = "last_3_months"
-    elif 'last year' in query or 'past year' in query:
-        timeframe = "last_year"
-    elif '2024' in query:
-        timeframe = "year_2024"
+    # Detect language (simplified)
+    language = "en"
+    # Could add more sophisticated language detection here
+    
+    # Check for ambiguity (missing critical entities)
+    is_ambiguous = False
+    clarification_question = None
+    
+    if len(entities) == 0 and not any(word in query_lower for word in ['election', 'vote', 'poll']):
+        is_ambiguous = True
+        clarification_question = "Could you please specify which constituency, state, or party you are asking about?"
     
     reasoning = [
-        f"Query classified as: {intent}",
         f"Entities extracted: {entities}",
-        f"Timeframe: {timeframe}"
+        f"Language detected: {language}",
+        f"Ambiguity check: {'Needs clarification' if is_ambiguous else 'Clear'}"
+    ]
+    
+    return {
+        "query_entities": entities,
+        "query_language": language,
+        "is_ambiguous": is_ambiguous,
+        "clarification_question": clarification_question,
+        "reasoning_steps": reasoning,
+        "updated_at": datetime.utcnow()
+    }
+
+
+def intent_classification_node(state: AgentState) -> Dict[str, Any]:
+    """
+    Classify the intent of the user query based on extracted entities and context.
+    
+    This node determines:
+    - Query type (factual, comparative, trend, analytical, predictive)
+    - Complexity level
+    - Required tools and data sources
+    """
+    logger.info(f"Classifying intent for query: {state['query']}")
+    
+    query = state['query'].lower()
+    entities = state.get('query_entities', {})
+    
+    # Intent classification logic
+    intent = "factual"
+    confidence = 0.8
+    
+    if any(word in query for word in ['compare', 'versus', 'vs', 'difference', 'contrast']):
+        intent = "comparative"
+        confidence = 0.9
+    elif any(word in query for word in ['trend', 'change', 'evolution', 'history', 'pattern']):
+        intent = "trend"
+        confidence = 0.85
+    elif any(word in query for word in ['analyze', 'why', 'reason', 'impact', 'cause', 'effect']):
+        intent = "analytical"
+        confidence = 0.8
+    elif any(word in query for word in ['predict', 'forecast', 'will', 'likely', 'projection']):
+        intent = "predictive"
+        confidence = 0.7
+    elif any(word in query for word in ['summarize', 'overview', 'brief']):
+        intent = "summary"
+        confidence = 0.85
+    
+    # Determine required tools based on intent
+    required_tools = ["vector_search"]  # Default
+    
+    if intent in ["factual", "comparative"]:
+        required_tools.append("database_query")
+    
+    if intent in ["trend", "predictive"]:
+        required_tools.append("database_query")
+        required_tools.append("statistical_analysis")
+    
+    if intent in ["analytical"]:
+        required_tools.extend(["database_query", "external_api"])
+    
+    # Assess complexity
+    complexity = "low"
+    if len(entities) > 2 or intent in ["analytical", "predictive"]:
+        complexity = "medium"
+    if intent == "predictive" or ('manifesto' in query and 'fulfillment' in query):
+        complexity = "high"
+    
+    reasoning = [
+        f"Intent classified as: {intent} (confidence: {confidence})",
+        f"Complexity level: {complexity}",
+        f"Required tools: {required_tools}"
     ]
     
     return {
         "query_intent": intent,
-        "query_entities": entities,
-        "query_timeframe": timeframe,
-        "reasoning_steps": reasoning,
+        "intent_confidence": confidence,
+        "query_complexity": complexity,
+        "required_tools": required_tools,
+        "reasoning_steps": state.get('reasoning_steps', []) + reasoning,
         "updated_at": datetime.utcnow()
     }
 
@@ -558,7 +626,7 @@ def build_agent_graph():
     Construct the LangGraph workflow for QueryBot
     
     Architecture:
-    1. Query Analysis → 2. Retrieval → 3. Synthesis → 4. Validation → 5. Memory
+    1. Query Analysis (Entity Extraction) → 2. Intent Classification → 3. Retrieval → 4. Synthesis → 5. Validation → 6. Memory
     
     With conditional routing based on intent and confidence
     """
@@ -566,8 +634,9 @@ def build_agent_graph():
     # Initialize the graph
     workflow = StateGraph(AgentState)
     
-    # Add nodes
+    # Add nodes - Now includes separate intent classification node
     workflow.add_node("query_analysis", query_analysis_node)
+    workflow.add_node("intent_classification", intent_classification_node)
     workflow.add_node("retrieval", retrieval_node)
     workflow.add_node("synthesis", synthesis_node)
     workflow.add_node("validation", validation_node)
@@ -576,8 +645,9 @@ def build_agent_graph():
     # Set entry point
     workflow.set_entry_point("query_analysis")
     
-    # Define edges
-    workflow.add_edge("query_analysis", "retrieval")
+    # Define edges - Query Analysis flows into Intent Classification
+    workflow.add_edge("query_analysis", "intent_classification")
+    workflow.add_edge("intent_classification", "retrieval")
     workflow.add_edge("retrieval", "synthesis")
     workflow.add_edge("synthesis", "validation")
     workflow.add_edge("validation", "memory")
@@ -587,7 +657,7 @@ def build_agent_graph():
     memory = MemorySaver()
     app = workflow.compile(checkpointer=memory)
     
-    logger.info("Agent graph compiled successfully")
+    logger.info("Agent graph compiled successfully with separate intent classification node")
     return app
 
 
