@@ -1,5 +1,5 @@
 ```
-# Python
+# Dependencies
 __pycache__/
 *.py[cod]
 *$py.class
@@ -42,7 +42,12 @@ coverage.xml
 .env
 .venv.bak
 .env.local
-.env.*
+*.env.*
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
 
 # IDE
 .vscode/
