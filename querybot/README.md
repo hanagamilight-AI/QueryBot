@@ -599,6 +599,255 @@ print(f"Category Breakdown: {report.category_scores}")
 
 ---
 
+## Query Flow Examples
+
+### Example 1: Factual Query Flow
+
+**User Query**: *"What was the voter turnout in Patna during the 2020 election?"*
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│ Step 1: User submits query via API                                      │
+│ POST /query { "question": "What was the voter turnout in Patna..."}    │
+└────────────────────────────────┬────────────────────────────────────────┘
+                                 ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ Step 2: Cache Check (HybridCache)                                       │
+│ Key: hash(query="voter turnout Patna 2020", params={})                  │
+│ Result: ❌ CACHE MISS (first time query)                                 │
+└────────────────────────────────┬────────────────────────────────────────┘
+                                 ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ Step 3: Query Analysis Agent                                            │
+│ • Parse: "voter turnout" → metric, "Patna" → constituency,             │
+│          "2020" → year                                                  │
+│ • Intent: FACTUAL (single fact lookup)                                  │
+│ • Entities: {constituency: "Patna", year: 2020, metric: "turnout"}     │
+│ • Guardrails: ✅ Pass (length OK, no harmful content, no PII)          │
+└────────────────────────────────┬────────────────────────────────────────┘
+                                 ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ Step 4: Intent Classification Agent                                     │
+│ • Classified as: FACTUAL                                                │
+│ • Routing: Direct vector search + exact SQL match                       │
+└────────────────────────────────┬────────────────────────────────────────┘
+                                 ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ Step 5: Retrieval Agent                                                 │
+│ • Vector Search: pgvector similarity on election documents             │
+│   Query: "voter turnout Patna 2020 election"                           │
+│   Filters: constituency='Patna', year=2020                             │
+│   Results: Top 5 chunks with relevance scores                          │
+│ • SQL Query: SELECT turnout FROM election_results                      │
+│              WHERE constituency='Patna' AND year=2020                   │
+│   Result: 68.4%                                                         │
+└────────────────────────────────┬────────────────────────────────────────┘
+                                 ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ Step 6: Synthesis Agent                                                 │
+│ • Generates: "The voter turnout in Patna during the 2020 election      │
+│             was 68.4%, according to Election Commission data."         │
+│ • Confidence: 0.94 (high - exact match found)                           │
+│ • Sources: [{doc_id: "ec_2020_patna", source: "Election Commission"}]  │
+└────────────────────────────────┬────────────────────────────────────────┘
+                                 ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ Step 7: Validation Agent                                                │
+│ • Output validation: ✅ Answers the query                               │
+│ • Hallucination check: ✅ Claim supported by source                     │
+│ • Confidence threshold: ✅ 0.94 > 0.6                                   │
+│ • Source attribution: ✅ Present                                        │
+│ • Political guardrails: ✅ No sensitive issues                          │
+└────────────────────────────────┬────────────────────────────────────────┘
+                                 ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ Step 8: Memory Agent                                                    │
+│ • Short-term: Store in Redis (session context, TTL=30min)              │
+│ • Long-term: Embed conversation in pgvector for future retrieval       │
+└────────────────────────────────┬────────────────────────────────────────┘
+                                 ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ Step 9: Cache Storage                                                   │
+│ • Store response in Redis with key hash                                │
+│ • TTL: 3600 seconds (1 hour) for factual queries                        │
+└────────────────────────────────┬────────────────────────────────────────┘
+                                 ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ Step 10: Response to User                                               │
+│ {                                                                       │
+│   "response": "The voter turnout in Patna during the 2020 election     │
+│               was 68.4%...",                                            │
+│   "confidence_score": 0.94,                                             │
+│   "sources": [...],                                                     │
+│   "cached": false                                                       │
+│ }                                                                       │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+**If Same Query Asked Again (within 1 hour)**:
+- Step 2 returns ✅ **CACHE HIT**
+- Steps 3-9 are **SKIPPED**
+- Response served directly from Redis in <10ms
+- `cached: true` flag added to response
+
+---
+
+### Example 2: Complex Analytical Query Flow
+
+**User Query**: *"Compare the manifesto promises of Party A vs Party B regarding agriculture in Bihar and analyze their fulfillment status."*
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│ Step 1: User submits complex analytical query                           │
+│ POST /chat { "session_id": "sess-123",                                  │
+│              "message": "Compare manifesto promises..." }               │
+└────────────────────────────────┬────────────────────────────────────────┘
+                                 ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ Step 2: Cache Check                                                     │
+│ Key: hash(query="compare manifesto Party A Party B agriculture Bihar", │
+│       params={session_id: "sess-123"})                                  │
+│ Result: ❌ CACHE MISS (complex query, never asked before)               │
+└────────────────────────────────┬────────────────────────────────────────┘
+                                 ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ Step 3: Query Analysis Agent                                            │
+│ • Parse: Multiple entities detected                                     │
+│   - Parties: ["Party A", "Party B"]                                    │
+│   - Topic: "agriculture"                                                │
+│   - Location: "Bihar"                                                   │
+│   - Task: "compare" + "analyze fulfillment"                            │
+│ • Intent: ANALYTICAL (requires multi-step reasoning)                    │
+│ • Guardrails: ✅ Pass                                                   │
+└────────────────────────────────┬────────────────────────────────────────┘
+                                 ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ Step 4: Intent Classification Agent                                     │
+│ • Classified as: ANALYTICAL + COMPARATIVE                               │
+│ • Decision: Requires multi-hop retrieval + tool execution              │
+│ • Plan:                                                                 │
+│   1. Retrieve Party A agriculture promises                              │
+│   2. Retrieve Party B agriculture promises                              │
+│   3. Fetch fulfillment data for both                                    │
+│   4. Synthesize comparison                                              │
+└────────────────────────────────┬────────────────────────────────────────┘
+                                 ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ Step 5: Retrieval Agent (Parallel Execution)                            │
+│ ┌─────────────────────────────────┐  ┌────────────────────────────────┐ │
+│ │ Query 1: Party A Manifesto      │  │ Query 2: Party B Manifesto     │ │
+│ │ • Vector: "Party A agriculture  │  │ • Vector: "Party B agriculture │ │
+│ │   promises Bihar"               │  │   promises Bihar"              │ │
+│ │ • SQL: party='Party A' AND      │  │ • SQL: party='Party B' AND     │ │
+│ │   topic='agriculture'           │  │   topic='agriculture'          │ │
+│ │ Results: 8 chunks               │  │ Results: 7 chunks              │ │
+│ └─────────────────────────────────┘  └────────────────────────────────┘ │
+│                                                                          │
+│ ┌─────────────────────────────────┐  ┌────────────────────────────────┐ │
+│ │ Query 3: Fulfillment Data       │  │ Query 4: Implementation Stats  │ │
+│ │ • Tool: database_query()        │  │ • Tool: external_api()         │ │
+│ │ • SQL: SELECT * FROM            │  │ • News API: "Party A Bihar     │ │
+│ │   policy_fulfillment WHERE      │  │   agriculture schemes"         │ │
+│ │   party IN ('A','B')            │  │ • Social listening sentiment   │ │
+│ │ Results: 15 records             │  │ Results: 12 articles           │ │
+│ └─────────────────────────────────┘  └────────────────────────────────┘ │
+└────────────────────────────────┬────────────────────────────────────────┘
+                                 ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ Step 6: Tool Execution Agent (MCP)                                      │
+│ • Executes database_query tool with filters                             │
+│ • Calls external_api for real-time news                                 │
+│ • Rate limit check: ✅ Within quota (5/30 per minute)                   │
+│ • Action confirmation: Not needed (medium risk)                         │
+│ • Audit log: All tool calls recorded                                    │
+└────────────────────────────────┬────────────────────────────────────────┘
+                                 ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ Step 7: Synthesis Agent                                                 │
+│ • Multi-step reasoning:                                                 │
+│   1. Extract Party A promises (3 key points)                           │
+│   2. Extract Party B promises (3 key points)                           │
+│   3. Compare side-by-side in table format                              │
+│   4. Assess fulfillment with evidence                                  │
+│ • Generates structured response with:                                   │
+│   - Comparison table                                                    │
+│   - Fulfillment analysis                                                │
+│   - Supporting evidence citations                                       │
+│ • Confidence: 0.78 (moderate - some data gaps)                          │
+└────────────────────────────────┬────────────────────────────────────────┘
+                                 ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ Step 8: Validation Agent                                                │
+│ • Output validation: ✅ Comprehensive comparison provided               │
+│ • Hallucination check: ⚠️ One claim lacks direct source                │
+│   → Action: Add disclaimer "Based on available data..."                │
+│ • Confidence threshold: ✅ 0.78 > 0.6                                   │
+│ • Source attribution: ✅ All major claims cited                         │
+│ • Political guardrails: ✅ Balanced presentation, no bias detected      │
+│ • Safety compliance: ✅ No inflammatory language                        │
+└────────────────────────────────┬────────────────────────────────────────┘
+                                 ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ Step 9: Memory Agent                                                    │
+│ • Short-term (Redis):                                                   │
+│   - Store full conversation turn                                        │
+│   - Track entities: Party A, Party B, Bihar, agriculture               │
+│   - Enable follow-up: "What about education?"                          │
+│ • Long-term (pgvector):                                                 │
+│   - Embed conversation for cross-session learning                       │
+│   - Link to user profile (anonymized)                                   │
+└────────────────────────────────┬────────────────────────────────────────┘
+                                 ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ Step 10: Observability Tracing                                          │
+│ • Langfuse: Complete trace with all spans                              │
+│   - Query Analysis: 45ms                                                │
+│   - Retrieval (parallel): 320ms                                         │
+│   - Tool Execution: 180ms                                               │
+│   - Synthesis: 890ms                                                    │
+│   - Validation: 65ms                                                    │
+│   Total latency: 1.5s                                                   │
+│ • Metrics:                                                              │
+│   - Counter: analytical_queries_total++                                 │
+│   - Histogram: query_duration_seconds=1.5                               │
+│   - Gauge: active_sessions=47                                           │
+└────────────────────────────────┬────────────────────────────────────────┘
+                                 ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ Step 11: Cache Storage                                                  │
+│ • Store in Redis with longer TTL (2 hours for analytical)              │
+│ • Key includes session context for personalization                     │
+└────────────────────────────────┬────────────────────────────────────────┘
+                                 ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ Step 12: Response to User                                               │
+│ {                                                                       │
+│   "response": "## Comparison of Agriculture Manifesto Promises...      │
+│               | Promise Area | Party A | Party B | ...                 │
+│               ## Fulfillment Analysis...[detailed response]",           │
+│   "confidence_score": 0.78,                                             │
+│   "sources": [12 citations],                                            │
+│   "reasoning_steps": ["Extracted promises", "Compared policies", ...], │
+│   "follow_up_suggestions": [                                            │
+│     "How do these compare at national level?",                          │
+│     "What were the key education promises?"                             │
+│   ],                                                                    │
+│   "cached": false,                                                      │
+│   "latency_ms": 1500                                                    │
+│ }                                                                       │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+**Key Differences from Example 1**:
+- Multi-hop retrieval (4 parallel queries vs 1)
+- Tool execution required (database + external APIs)
+- Complex reasoning with comparison table
+- Lower confidence due to data complexity
+- Longer cache TTL for expensive computation
+- Full observability tracing for debugging
+
+---
+
 ## Agent State Flow
 
 ```
