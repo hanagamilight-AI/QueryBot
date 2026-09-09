@@ -45,6 +45,10 @@ coverage.xml
 *.py,cover
 .hypothesis/
 .pytest_cache/
+.julia/
+zig*/
+target/
+.gradle/
 
 # Translations
 *.mo
@@ -119,7 +123,7 @@ dmypy.json
 # Pyre type checker
 .pyre/
 
-# IDE
+# Editor/IDE files
 .vscode/
 .idea/
 
