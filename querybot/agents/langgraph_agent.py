@@ -1,11 +1,13 @@
 """
 LangGraph-based Agent Architecture for QueryBot
-Implements a multi-agent system with specialized roles for political intelligence analysis
+Implements a multi-agent system with LLM-driven reasoning for political intelligence analysis
 """
 from typing import TypedDict, Annotated, List, Dict, Any, Optional
 from datetime import datetime
 from loguru import logger
 import operator
+import json
+import re
 
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
@@ -14,6 +16,8 @@ from tools.mcp_tools import MCP_TOOLS, get_tool, ToolResult
 from config.settings import settings
 from cache.hybrid_cache import get_cache, CacheNamespace
 from embeddings.embedder import get_embedding_service, EmbeddingService
+from models.adapters import get_model_adapter, ModelAdapter
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 
 
 # ============================================================================
@@ -38,6 +42,7 @@ class AgentState(TypedDict):
     query_intent: str  # classification of query type
     query_entities: Dict[str, str]  # extracted entities (constituency, party, etc.)
     query_timeframe: Optional[str]
+    resolved_query: str  # Query with pronouns resolved
     
     # Tool execution
     tool_calls: List[Dict[str, Any]]
@@ -54,8 +59,245 @@ class AgentState(TypedDict):
 
 
 # ============================================================================
+# LLM AGENT PROMPTS
+# ============================================================================
+
+QUERY_ANALYSIS_PROMPT = """You are the Query Analysis Agent for a Political Intelligence System.
+Your goal is to analyze the user's query in the context of conversation history.
+
+TASKS:
+1. Resolve any pronouns (e.g., "they", "it", "that party", "the former") using the conversation history.
+2. Extract key entities: Constituency, Party, Candidate, Date, Topic.
+3. Detect the language of the query.
+4. Identify if the query is ambiguous.
+
+Return ONLY a valid JSON object with this exact structure:
+{
+    "resolved_query": "The query with pronouns replaced by specific entities from history",
+    "entities": {"entity_name": "entity_type"},
+    "language": "en",
+    "ambiguity_score": 0.1
+}
+
+Conversation History:
+{history}
+
+Current Query: {query}
+"""
+
+INTENT_PLANNING_PROMPT = """You are the Intent Planning Agent for a Political Intelligence System.
+Based on the resolved query and entities, determine the user's intent and create an execution plan.
+
+INTENT CATEGORIES:
+- FACTUAL: Direct data lookup (e.g., "What was the voter turnout in Patna?")
+- COMPARATIVE: Compare two or more entities (e.g., "Compare BJP vs Congress performance")
+- TREND: Time-series analysis (e.g., "How has voting pattern changed over 10 years?")
+- ANALYTICAL: Complex reasoning requiring multiple steps (e.g., "What impact did policy X have on demographic Y?")
+- CONVERSATIONAL: General chat, greetings, or non-data queries
+
+Return ONLY a valid JSON object:
+{
+    "intent": "FACTUAL",
+    "confidence": 0.95,
+    "sub_queries": ["decomposed sub-query 1", "sub-query 2"],
+    "required_tools": ["vector_search", "sql_query"],
+    "parallel_groups": [[0, 1]],
+    "execution_strategy": "sequential|parallel"
+}
+
+Resolved Query: {resolved_query}
+Entities: {entities}
+"""
+
+RETRIEVAL_PROMPT = """You are the Retrieval Agent for a Political Intelligence System.
+Your job is to formulate optimal search queries for the vector database and SQL filters.
+
+Given the sub-queries and entities, generate specific search strings and metadata filters.
+Return ONLY a valid JSON object:
+{
+    "search_steps": [
+        {"query": "vector search string", "filters": {"constituency": "...", "date_gte": "..."}, "tool": "vector_search"}
+    ]
+}
+
+Sub-queries: {sub_queries}
+Entities: {entities}
+"""
+
+SYNTHESIS_PROMPT = """You are the Synthesis Agent for a Political Intelligence System.
+Synthesize the retrieved documents into a coherent, accurate, and neutral political intelligence report.
+
+GUIDELINES:
+- Cite sources explicitly (e.g., [Source: Election Commission 2020])
+- Do not hallucinate facts. If data is missing, state it clearly.
+- Maintain a professional, objective, and analytical tone.
+- Structure the response logically with clear sections.
+
+Retrieved Documents:
+{documents}
+
+Original Query: {query}
+Intent: {intent}
+"""
+
+VALIDATION_PROMPT = """You are the Validation Agent for a Political Intelligence System.
+Verify the synthesized response against the retrieved context.
+
+CHECKS:
+1. Check for hallucinations (facts not supported by the retrieved context).
+2. Check for bias or non-neutral language.
+3. Ensure all claims are properly cited.
+4. Verify the response directly answers the original query.
+
+Return ONLY a valid JSON object:
+{
+    "is_valid": true,
+    "issues": [],
+    "confidence_score": 0.92,
+    "suggested_corrections": ""
+}
+
+Original Query: {query}
+Retrieved Context: {context}
+Synthesized Response: {response}
+"""
+
+
+# ============================================================================
 # NODE IMPLEMENTATIONS
 # ============================================================================
+
+def _call_llm(prompt_template: str, variables: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Helper function to call LLM with prompt and parse JSON response.
+    Uses the configured model adapter from settings.
+    """
+    try:
+        # Get model adapter
+        adapter = get_model_adapter(provider=settings.LLM_PROVIDER)
+        
+        # Format prompt with variables
+        prompt = prompt_template.format(**variables)
+        
+        # Create messages for LLM
+        messages = [
+            SystemMessage(content="You are a helpful assistant for a Political Intelligence System. Always respond with valid JSON only, no additional text."),
+            HumanMessage(content=prompt)
+        ]
+        
+        # Call LLM
+        response = adapter.generate(messages)
+        
+        # Parse JSON response
+        response_text = response.content.strip()
+        # Remove markdown code blocks if present
+        if response_text.startswith("```json"):
+            response_text = response_text[7:]
+        if response_text.endswith("```"):
+            response_text = response_text[:-3]
+        response_text = response_text.strip()
+        
+        result = json.loads(response_text)
+        return result
+        
+    except Exception as e:
+        logger.error(f"LLM call failed: {e}")
+        return {}
+
+
+def query_analysis_node(state: AgentState) -> Dict[str, Any]:
+    """
+    Analyze user query using LLM to extract entities and resolve pronouns.
+    
+    This node performs:
+    - Pronoun resolution using conversation history (via LLM)
+    - Entity extraction (constituency, party, candidate, date ranges)
+    - Language detection
+    - Ambiguity detection
+    """
+    logger.info(f"Analyzing query with LLM: {state['query']}")
+    
+    # Format conversation history for prompt
+    history_text = ""
+    conv_history = state.get('conversation_history', [])
+    if conv_history:
+        for turn in conv_history[-5:]:  # Last 5 turns
+            role = turn.get('role', 'user')
+            message = turn.get('message', '')
+            history_text += f"{role.capitalize()}: {message}\n"
+    
+    # Call LLM for query analysis
+    llm_result = _call_llm(QUERY_ANALYSIS_PROMPT, {
+        "history": history_text,
+        "query": state['query']
+    })
+    
+    resolved_query = llm_result.get('resolved_query', state['query'])
+    entities = llm_result.get('entities', {})
+    language = llm_result.get('language', 'en')
+    ambiguity_score = llm_result.get('ambiguity_score', 0.5)
+    
+    reasoning = [
+        f"LLM resolved query: {resolved_query}",
+        f"Entities extracted: {entities}",
+        f"Language detected: {language}",
+        f"Ambiguity score: {ambiguity_score}"
+    ]
+    
+    return {
+        "resolved_query": resolved_query,
+        "query_entities": entities,
+        "query_language": language,
+        "ambiguity_score": ambiguity_score,
+        "reasoning_steps": reasoning,
+        "updated_at": datetime.utcnow()
+    }
+
+
+def intent_planning_node(state: AgentState) -> Dict[str, Any]:
+    """
+    Determine query intent and create execution plan using LLM.
+    
+    This node performs:
+    - Intent classification (FACTUAL, COMPARATIVE, TREND, ANALYTICAL, CONVERSATIONAL)
+    - Query decomposition into sub-queries
+    - Tool selection
+    - Parallel execution planning
+    """
+    logger.info(f"Planning execution with LLM for: {state.get('resolved_query', state['query'])}")
+    
+    # Call LLM for intent planning
+    llm_result = _call_llm(INTENT_PLANNING_PROMPT, {
+        "resolved_query": state.get('resolved_query', state['query']),
+        "entities": state.get('query_entities', {})
+    })
+    
+    intent = llm_result.get('intent', 'FACTUAL')
+    confidence = llm_result.get('confidence', 0.5)
+    sub_queries = llm_result.get('sub_queries', [state['query']])
+    required_tools = llm_result.get('required_tools', ['vector_search'])
+    parallel_groups = llm_result.get('parallel_groups', [[0]])
+    execution_strategy = llm_result.get('execution_strategy', 'sequential')
+    
+    reasoning = [
+        f"Intent classified: {intent} (confidence: {confidence})",
+        f"Sub-queries: {sub_queries}",
+        f"Required tools: {required_tools}",
+        f"Execution strategy: {execution_strategy}"
+    ]
+    
+    return {
+        "query_intent": intent,
+        "intent_confidence": confidence,
+        "execution_plan": {
+            "sub_queries": sub_queries,
+            "required_tools": required_tools,
+            "parallel_groups": parallel_groups,
+            "execution_strategy": execution_strategy
+        },
+        "reasoning_steps": reasoning,
+        "updated_at": datetime.utcnow()
+    }
 
 def query_analysis_node(state: AgentState) -> Dict[str, Any]:
     """
