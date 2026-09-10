@@ -13,7 +13,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from tools.mcp_tools import MCP_TOOLS, get_tool, ToolResult
 from config.settings import settings
 from cache.hybrid_cache import get_cache, CacheNamespace
-from embeddings.embedder import get_embedder
+from embeddings.embedder import get_embedding_service, EmbeddingService
 
 
 # ============================================================================
@@ -129,76 +129,6 @@ def query_analysis_node(state: AgentState) -> Dict[str, Any]:
     }
 
 
-def intent_classification_node(state: AgentState) -> Dict[str, Any]:
-    """
-    Classify the intent of the user query based on extracted entities and context.
-    
-    This node determines:
-    - Query type (factual, comparative, trend, analytical, predictive)
-    - Complexity level
-    - Required tools and data sources
-    """
-    logger.info(f"Classifying intent for query: {state['query']}")
-    
-    query = state['query'].lower()
-    entities = state.get('query_entities', {})
-    
-    # Intent classification logic
-    intent = "factual"
-    confidence = 0.8
-    
-    if any(word in query for word in ['compare', 'versus', 'vs', 'difference', 'contrast']):
-        intent = "comparative"
-        confidence = 0.9
-    elif any(word in query for word in ['trend', 'change', 'evolution', 'history', 'pattern']):
-        intent = "trend"
-        confidence = 0.85
-    elif any(word in query for word in ['analyze', 'why', 'reason', 'impact', 'cause', 'effect']):
-        intent = "analytical"
-        confidence = 0.8
-    elif any(word in query for word in ['predict', 'forecast', 'will', 'likely', 'projection']):
-        intent = "predictive"
-        confidence = 0.7
-    elif any(word in query for word in ['summarize', 'overview', 'brief']):
-        intent = "summary"
-        confidence = 0.85
-    
-    # Determine required tools based on intent
-    required_tools = ["vector_search"]  # Default
-    
-    if intent in ["factual", "comparative"]:
-        required_tools.append("database_query")
-    
-    if intent in ["trend", "predictive"]:
-        required_tools.append("database_query")
-        required_tools.append("statistical_analysis")
-    
-    if intent in ["analytical"]:
-        required_tools.extend(["database_query", "external_api"])
-    
-    # Assess complexity
-    complexity = "low"
-    if len(entities) > 2 or intent in ["analytical", "predictive"]:
-        complexity = "medium"
-    if intent == "predictive" or ('manifesto' in query and 'fulfillment' in query):
-        complexity = "high"
-    
-    reasoning = [
-        f"Intent classified as: {intent} (confidence: {confidence})",
-        f"Complexity level: {complexity}",
-        f"Required tools: {required_tools}"
-    ]
-    
-    return {
-        "query_intent": intent,
-        "intent_confidence": confidence,
-        "query_complexity": complexity,
-        "required_tools": required_tools,
-        "reasoning_steps": state.get('reasoning_steps', []) + reasoning,
-        "updated_at": datetime.utcnow()
-    }
-
-
 def retrieval_node(state: AgentState) -> Dict[str, Any]:
     """
     Retrieve relevant documents using vector search and database queries
@@ -207,42 +137,11 @@ def retrieval_node(state: AgentState) -> Dict[str, Any]:
     - Performs semantic search via pgvector
     - Executes structured database queries
     - Aggregates results from multiple sources
-    - Checks cache first for faster responses
-    """
-    logger.info("Executing retrieval strategies")
     
-    # Check cache first if enabled
-    if settings.CACHE_ENABLED:
-        try:
-            cache = get_cache(similarity_threshold=settings.CACHE_SIMILARITY_THRESHOLD)
-            
-            # Generate embedding for semantic cache lookup
-            embedder = get_embedder()
-            query_vector = embedder.embed_query(state['query'])
-            
-            # Try to get cached response
-            cache_hit = cache.get(
-                query=state['query'],
-                parameters=state.get('query_entities', {}),
-                namespace=CacheNamespace.QUERY_RESPONSE,
-                query_vector=query_vector
-            )
-            
-            if cache_hit:
-                logger.info(f"Cache HIT ({cache_hit.hit_type}) - similarity: {cache_hit.similarity_score}")
-                
-                # Return cached response directly
-                return {
-                    "retrieved_documents": cache_hit.entry.value.get('documents', []),
-                    "tool_results": [],
-                    "reasoning_steps": [f"Response retrieved from cache ({cache_hit.hit_type} match)",
-                                       f"Cache retrieval time: {cache_hit.retrieval_time_ms:.2f}ms"],
-                    "from_cache": True,
-                    "cached_response": cache_hit.entry.value.get('response'),
-                    "updated_at": datetime.utcnow()
-                }
-        except Exception as e:
-            logger.warning(f"Cache lookup failed, proceeding with normal retrieval: {e}")
+    NOTE: Cache checking is handled earlier in the pipeline for efficiency.
+    This node only executes if there was a cache MISS.
+    """
+    logger.info("Executing retrieval strategies (Cache Miss)")
     
     retrieved_docs = []
     tool_results = []
@@ -315,7 +214,6 @@ def retrieval_node(state: AgentState) -> Dict[str, Any]:
         "retrieved_documents": unique_docs[:15],  # Limit context
         "tool_results": tool_results,
         "reasoning_steps": reasoning,
-        "from_cache": False,
         "updated_at": datetime.utcnow()
     }
 
@@ -389,7 +287,7 @@ def synthesis_node(state: AgentState) -> Dict[str, Any]:
     if not state.get('from_cache') and settings.CACHE_ENABLED:
         try:
             cache = get_cache(similarity_threshold=settings.CACHE_SIMILARITY_THRESHOLD)
-            embedder = get_embedder()
+            embedder = get_embedding_service()
             query_vector = embedder.embed_query(query)
             
             # Store response with documents
@@ -618,6 +516,173 @@ def route_by_intent(state: AgentState) -> str:
 
 
 # ============================================================================
+# INTENT PLANNING NODE (Combined Classification + Planning)
+# ============================================================================
+
+def intent_planning_node(state: AgentState) -> Dict[str, Any]:
+    """
+    Combined Intent Classification and Planning Agent
+    
+    This node performs:
+    1. Intent Classification: Determines query type (factual, comparative, trend, analytical)
+    2. Complexity Assessment: Evaluates query difficulty
+    3. Query Decomposition: Breaks complex queries into sub-queries
+    4. Tool Selection: Identifies required MCP tools
+    5. Execution Planning: Defines parallel/sequential execution strategy
+    
+    Returns:
+        Dictionary with intent, complexity, execution plan, and tool requirements
+    """
+    logger.info(f"Performing intent classification and planning: {state['query']}")
+    
+    query = state['query']
+    entities = state.get('query_entities', {})
+    
+    # Intent Classification (rule-based for now, can be enhanced with LLM)
+    query_lower = query.lower()
+    
+    # Determine intent based on keywords
+    if any(word in query_lower for word in ['compare', 'versus', 'vs', 'difference between']):
+        intent = 'comparative'
+    elif any(word in query_lower for word in ['trend', 'over time', 'historical', 'change', 'evolution']):
+        intent = 'trend'
+    elif any(word in query_lower for word in ['analyze', 'analysis', 'why', 'impact', 'effect', 'correlation']):
+        intent = 'analytical'
+    else:
+        intent = 'factual'
+    
+    # Complexity assessment
+    complexity = 'low'
+    if intent in ['analytical', 'comparative'] and len(entities) >= 2:
+        complexity = 'high'
+    elif intent == 'trend' or len(query.split()) > 15:
+        complexity = 'medium'
+    
+    # Query decomposition for complex queries
+    sub_queries = []
+    parallel_groups = []
+    
+    if intent == 'comparative' and 'party' in entities:
+        # Split comparison into separate entity lookups
+        sub_queries.append(f"{entities.get('party', '')} position on query topic")
+        parallel_groups.append([0])  # Can run in parallel
+    elif intent == 'analytical':
+        sub_queries.append("background context")
+        sub_queries.append("specific analysis data")
+        parallel_groups.append([0, 1])  # Both can run in parallel
+    
+    # Tool selection based on intent
+    required_tools = ['vector_search']  # Always need vector search
+    
+    if intent in ['factual', 'comparative']:
+        required_tools.append('database_query')
+    
+    if intent == 'trend' or 'recent' in query_lower:
+        required_tools.append('external_api')
+    
+    if complexity == 'high':
+        required_tools.append('conversation_memory')  # May need context
+    
+    reasoning = [
+        f"Intent classified as: {intent}",
+        f"Complexity level: {complexity}",
+        f"Required tools: {required_tools}",
+        f"Sub-queries planned: {len(sub_queries)}" if sub_queries else "No decomposition needed"
+    ]
+    
+    return {
+        "query_intent": intent,
+        "query_complexity": complexity,
+        "sub_queries": sub_queries,
+        "parallel_groups": parallel_groups,
+        "required_tools": required_tools,
+        "reasoning_steps": reasoning,
+        "updated_at": datetime.utcnow()
+    }
+
+
+# ============================================================================
+# GRAPH CONSTRUCTION
+# ============================================================================
+# CACHE CHECK NODE (Early Exit Optimization)
+# ============================================================================
+
+def cache_check_node(state: AgentState) -> Dict[str, Any]:
+    """
+    Check parameter-aware hybrid cache for existing response.
+    
+    This node runs BEFORE intent planning to enable early exit on cache hits,
+    avoiding expensive LLM calls and database queries.
+    
+    Returns:
+        Dictionary with cache hit/miss status and cached response if available
+    """
+    logger.info("Checking parameter-aware hybrid cache")
+    
+    if not settings.CACHE_ENABLED:
+        logger.debug("Cache disabled, proceeding to planning")
+        return {
+            "cache_hit": False,
+            "updated_at": datetime.utcnow()
+        }
+    
+    try:
+        cache = get_cache(similarity_threshold=settings.CACHE_SIMILARITY_THRESHOLD)
+        embedder = get_embedding_service()
+        
+        # Generate embedding for semantic cache lookup
+        query_vector = embedder.embed_query(state['query'])
+        
+        # Check cache with parameters (constituency, party, etc.)
+        cache_hit_result = cache.get(
+            query=state['query'],
+            parameters=state.get('query_entities', {}),
+            namespace=CacheNamespace.QUERY_RESPONSE,
+            query_vector=query_vector
+        )
+        
+        if cache_hit_result:
+            logger.info(f"CACHE HIT ({cache_hit_result.hit_type}) - similarity: {cache_hit_result.similarity_score:.3f}")
+            
+            return {
+                "cache_hit": True,
+                "cached_response": cache_hit_result.entry.value.get('response'),
+                "retrieved_documents": cache_hit_result.entry.value.get('documents', []),
+                "confidence_score": cache_hit_result.entry.value.get('confidence', 0.95),
+                "cache_hit_type": cache_hit_result.hit_type,
+                "cache_similarity": cache_hit_result.similarity_score,
+                "reasoning_steps": [
+                    f"Response retrieved from cache ({cache_hit_result.hit_type} match)",
+                    f"Cache retrieval time: {cache_hit_result.retrieval_time_ms:.2f}ms",
+                    f"Similarity score: {cache_hit_result.similarity_score:.3f}"
+                ],
+                "from_cache": True,
+                "updated_at": datetime.utcnow()
+            }
+        else:
+            logger.debug("Cache MISS - proceeding to intent planning")
+            return {
+                "cache_hit": False,
+                "updated_at": datetime.utcnow()
+            }
+            
+    except Exception as e:
+        logger.warning(f"Cache check failed, proceeding with normal flow: {e}")
+        return {
+            "cache_hit": False,
+            "cache_error": str(e),
+            "updated_at": datetime.utcnow()
+        }
+
+
+def route_from_cache_check(state: AgentState) -> str:
+    """Route based on cache hit or miss"""
+    if state.get('cache_hit'):
+        return "hit"
+    return "miss"
+
+
+# ============================================================================
 # GRAPH CONSTRUCTION
 # ============================================================================
 
@@ -626,17 +691,18 @@ def build_agent_graph():
     Construct the LangGraph workflow for QueryBot
     
     Architecture:
-    1. Query Analysis (Entity Extraction) → 2. Intent Classification → 3. Retrieval → 4. Synthesis → 5. Validation → 6. Memory
+    1. Query Analysis → 2. Cache Check → 3. Intent Planning → 4. Retrieval → 5. Synthesis → 6. Validation → 7. Memory
     
-    With conditional routing based on intent and confidence
+    With early-exit optimization: Cache hits bypass all heavy processing.
     """
     
     # Initialize the graph
     workflow = StateGraph(AgentState)
     
-    # Add nodes - Now includes separate intent classification node
+    # Add nodes
     workflow.add_node("query_analysis", query_analysis_node)
-    workflow.add_node("intent_classification", intent_classification_node)
+    workflow.add_node("cache_check", cache_check_node)  # Early exit point
+    workflow.add_node("intent_planning", intent_planning_node)
     workflow.add_node("retrieval", retrieval_node)
     workflow.add_node("synthesis", synthesis_node)
     workflow.add_node("validation", validation_node)
@@ -645,9 +711,20 @@ def build_agent_graph():
     # Set entry point
     workflow.set_entry_point("query_analysis")
     
-    # Define edges - Query Analysis flows into Intent Classification
-    workflow.add_edge("query_analysis", "intent_classification")
-    workflow.add_edge("intent_classification", "retrieval")
+    # Define edges
+    workflow.add_edge("query_analysis", "cache_check")
+    
+    # Conditional edge: Cache check → Hit (skip to memory/end) or Miss (continue to planning)
+    workflow.add_conditional_edges(
+        "cache_check",
+        route_from_cache_check,
+        {
+            "hit": "synthesis",    # Cache hit: skip to synthesis (which will use cached response)
+            "miss": "intent_planning"  # Cache miss: proceed with full pipeline
+        }
+    )
+    
+    workflow.add_edge("intent_planning", "retrieval")
     workflow.add_edge("retrieval", "synthesis")
     workflow.add_edge("synthesis", "validation")
     workflow.add_edge("validation", "memory")
@@ -657,7 +734,7 @@ def build_agent_graph():
     memory = MemorySaver()
     app = workflow.compile(checkpointer=memory)
     
-    logger.info("Agent graph compiled successfully with separate intent classification node")
+    logger.info("Agent graph compiled successfully with cache optimization layer")
     return app
 
 

@@ -5,7 +5,7 @@ Using PostgreSQL with pgvector extension for hybrid search
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, JSON, Float, ForeignKey
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
-from sqlalchemy.dialects.postgresql import VECTOR
+from pgvector.sqlalchemy import Vector
 from datetime import datetime
 from typing import List, Optional
 import numpy as np
@@ -21,7 +21,7 @@ class Document(Base):
     
     id = Column(Integer, primary_key=True, autoincrement=True)
     content = Column(Text, nullable=False)
-    embedding = Column(VECTOR(settings.PGVECTOR_DIMENSION))
+    embedding = Column(Vector(settings.PGVECTOR_DIMENSION))
     
     # Metadata fields for filtering
     source_type = Column(String(50))  # election, survey, social_media, manifesto
@@ -53,7 +53,7 @@ class DocumentChunk(Base):
     document_id = Column(Integer, ForeignKey("documents.id"), nullable=False)
     chunk_index = Column(Integer, nullable=False)
     content = Column(Text, nullable=False)
-    embedding = Column(VECTOR(settings.PGVECTOR_DIMENSION))
+    embedding = Column(Vector(settings.PGVECTOR_DIMENSION))
     
     # Reference to parent document
     document = relationship("Document", back_populates="chunks")
