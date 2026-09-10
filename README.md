@@ -117,29 +117,76 @@ Output: {
 
 ---
 
-### 2. **Intent Classification Agent** 🎯
+### 2. **Intent Planning Agent** 🎯📋 *(Combined Intent + Planning)*
 
-**Role:** Determine the type of query and required processing strategy.
+**Role:** Classify query intent AND create executable execution plans in a single optimized step.
+
+**Why Combined?** Merging intent classification with planning reduces latency, ensures alignment between intent and strategy, and simplifies the agent graph while maintaining separation of concerns with Query Analysis.
 
 **Responsibilities:**
-- Classify intent: `factual`, `comparative`, `trend`, `analytical`, `predictive`, `summary`
-- Assess query complexity (low/medium/high)
-- Determine required tools (vector_search, database_query, external_api, statistical_analysis)
-- Provide confidence score for classification
+- **Intent Classification**: Identify query type (`factual`, `comparative`, `trend`, `analytical`, `predictive`, `summary`)
+- **Query Decomposition**: Break complex queries into atomic sub-tasks
+- **Tool Selection**: Choose appropriate MCP tools (vector_search, database_query, external_api, calculate, compare)
+- **Strategy Definition**: Determine execution mode (parallel vs. sequential vs. hybrid)
+- **Dependency Mapping**: Specify which steps depend on others
+- **Parallel Grouping**: Identify steps that can run concurrently
 
-**Input:** Enriched query from Query Analysis Agent  
-**Output:** Intent type, complexity, required tools, confidence
+**Input:** Enriched query from Query Analysis Agent (entities, context)  
+**Output:** Intent category, complexity, confidence, execution plan with steps
 
-**Example:**
-```
-Input: "Compare BJP vs Congress performance in Delhi 2020"
-Output: {
-  intent: "comparative",
-  complexity: "medium",
-  required_tools: ["vector_search", "database_query"],
-  confidence: 0.9
+**Execution Plan Structure:**
+```json
+{
+  "intent": "Compare manifesto promises of BJP and Congress",
+  "intent_category": "comparative",
+  "complexity": "medium",
+  "confidence": 0.92,
+  "execution_plan": {
+    "summary": "Parallel retrieval of both party manifestos followed by comparison",
+    "steps": [
+      {
+        "step_id": 1,
+        "action": "SEARCH_VECTOR",
+        "description": "Search BJP manifesto for agriculture promises in Bihar",
+        "query_params": {"query": "BJP agriculture manifesto Bihar", "filters": {"party": "BJP"}},
+        "parallel_group": 1,
+        "depends_on": []
+      },
+      {
+        "step_id": 2,
+        "action": "SEARCH_VECTOR",
+        "description": "Search Congress manifesto for agriculture promises in Bihar",
+        "query_params": {"query": "Congress agriculture manifesto Bihar", "filters": {"party": "Congress"}},
+        "parallel_group": 1,
+        "depends_on": []
+      },
+      {
+        "step_id": 3,
+        "action": "COMPARE",
+        "description": "Compare retrieved promises from both parties",
+        "depends_on": [1, 2],
+        "parallel_group": null
+      }
+    ],
+    "required_tools": ["vector_search", "compare"],
+    "execution_mode": "hybrid"
+  },
+  "reasoning": [
+    "Query contains comparative language ('compare')",
+    "Two distinct entities identified (BJP, Congress)",
+    "Parallel retrieval optimal for independent entity lookup",
+    "Comparison step requires both retrievals to complete"
+  ]
 }
 ```
+
+**Planning Rules:**
+1. **Simple Factual Queries** → Single step, direct retrieval
+2. **Comparative Queries** → Parallel retrieval of all entities being compared
+3. **Analytical Queries** → Multi-step with verification and external context
+4. **Trend Queries** → Sequential time-based retrieval with aggregation
+5. Always minimize steps while ensuring completeness
+6. Maximize parallelization where no dependencies exist
 
 ---
 
@@ -275,36 +322,59 @@ Step 4: Intent Classification Agent
    └─ Required tools: ["vector_search", "database_query"]
    │
    ▼
-Step 5: Retrieval Agent
-   ├─ Check Cache: MISS (no exact/semantic match)
+Step 5: Cache Check Node (NEW OPTIMIZATION)
+   ├─ Generates query embedding
+   ├─ Checks Redis for exact match: MISS
+   ├─ Checks pgvector for semantic match (>0.85): MISS
+   └─ Routes to Intent Planning (cache miss path)
+   │
+   ▼
+Step 6: Retrieval Agent
    ├─ Vector Search: Finds 8 relevant documents (similarity > 0.85)
    ├─ Database Query: Retrieves election_data WHERE constituency='Patna' AND year=2020
    └─ Aggregates: 10 total records
    │
    ▼
-Step 6: Synthesis Agent
+Step 7: Synthesis Agent
    ├─ Generates response with citations
    └─ Adds source attribution
    │
    ▼
-Step 7: Validation Agent
+Step 8: Validation Agent
    ├─ Checks: Relevance ✓, Sources ✓, Confidence > 0.7 ✓
    └─ No modifications needed
    │
    ▼
-Step 8: Memory Agent
+Step 9: Memory Agent
    ├─ Stores query + response in conversation_history
    └─ Updates session state
    │
    ▼
-Step 9: Cache Storage
+Step 10: Cache Storage
    ├─ Stores response in Redis with query embedding
    └─ Metadata: {constituency: "Patna", year: "2020", intent: "factual"}
    │
    ▼
-Step 10: Response returned to user
+Step 11: Response returned to user
    "Based on Election Commission data [Database - Patna - 2020], 
     the voter turnout was 55.2%..."
+
+**Cache Hit Scenario (Same Query Asked Again):**
+```
+Step 1-4: Same as above (Query Analysis → Intent Planning)
+   │
+   ▼
+Step 5: Cache Check Node
+   ├─ Generates query embedding
+   ├─ Checks Redis: EXACT MATCH FOUND!
+   ├─ Similarity Score: 1.0 (exact parameter match)
+   └─ EARLY EXIT: Returns cached response immediately
+   │
+   ▼
+Step 6: Response returned to user (<50ms latency)
+   "Based on Election Commission data [Database - Patna - 2020], 
+    the voter turnout was 55.2%..." [CACHED]
+```
 ```
 
 ---
@@ -326,20 +396,31 @@ Step 3: Query Analysis Agent
    └─ Ambiguity: false (entities clear)
    │
    ▼
-Step 4: Intent Classification Agent
+Step 4: Intent Planning Agent (Combined Classification + Planning)
    ├─ Intent: "analytical" (contains "compare" + "analyze")
    ├─ Complexity: "high" (multi-party, multi-step reasoning)
-   └─ Required tools: ["vector_search", "database_query", "external_api"]
+   ├─ Required tools: ["vector_search", "database_query", "external_api"]
+   └─ Execution Plan:
+      - Sub-query 1: Party A manifesto agriculture Bihar
+      - Sub-query 2: Party B manifesto agriculture Bihar
+      - Parallel Group: [1, 2] (can run concurrently)
    │
    ▼
-Step 5: Retrieval Agent (Parallel Execution)
+Step 5: Cache Check Node
+   ├─ Generates query embedding
+   ├─ Checks Redis for exact match: MISS (complex analytical query)
+   ├─ Checks pgvector for semantic match (>0.85): MISS
+   └─ Routes to Retrieval (cache miss path)
+   │
+   ▼
+Step 6: Retrieval Agent (Parallel Execution)
    ├─ Thread 1: Vector search for "Party A manifesto agriculture Bihar"
    ├─ Thread 2: Vector search for "Party B manifesto agriculture Bihar"
    ├─ Thread 3: Database query for manifesto_promises table
    └─ Thread 4: External API for recent fulfillment news
    │
    ▼
-Step 6: Synthesis Agent (Multi-hop Reasoning)
+Step 7: Synthesis Agent (Multi-hop Reasoning)
    ├─ Retrieves Party A promises (3 items)
    ├─ Retrieves Party B promises (4 items)
    ├─ Cross-references with fulfillment data
@@ -347,25 +428,25 @@ Step 6: Synthesis Agent (Multi-hop Reasoning)
    └─ Structures comparison table
    │
    ▼
-Step 7: Validation Agent
+Step 8: Validation Agent
    ├─ Hallucination check: All claims traced to sources ✓
    ├─ Balance check: Both parties covered equally ✓
    ├─ Sensitivity check: No inflammatory language ✓
    └─ Adds disclaimer: "Analysis based on available data up to [date]"
    │
    ▼
-Step 8: Memory Agent
+Step 9: Memory Agent
    ├─ Stores full conversation turn
    └─ Tags: ["manifesto_analysis", "comparative", "agriculture"]
    │
    ▼
-Step 9: Observability Tracking
+Step 10: Observability Tracking
    ├─ LangFuse: Logs trace with 4 parallel tool calls
    ├─ Metrics: Latency=2.3s, Token usage=1847
    └─ Behavior monitor: Flags high-complexity query for review
    │
    ▼
-Step 10: Response returned with comparison table and citations
+Step 11: Response returned with comparison table and citations
 ```
 
 ---

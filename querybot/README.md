@@ -123,44 +123,113 @@ The QueryBot system uses a **multi-agent architecture** orchestrated by LangGrap
 
 ### 1. Query Analysis Agent
 
-**Purpose**: Initial query processing and understanding
+**Purpose**: Initial query processing and entity extraction
 
 **Responsibilities**:
-- Parse natural language input
-- Classify query intent (factual, comparative, trend, analytical)
-- Extract entities (constituencies, parties, dates, candidates)
+- Parse natural language input (tokenization, normalization)
+- Extract entities (constituencies, parties, dates, candidates, locations)
+- Detect query language for multi-language support
+- Identify query ambiguity or missing context
 - Apply input guardrails (length limits, harmful content detection, PII filtering)
-- Determine required tools and data sources
+- Pass structured query to Intent Planning Agent for classification
 
 **Input**: Raw user query + session context
-**Output**: Structured query plan with intent, entities, and constraints
+**Output**: Structured query with extracted entities and metadata
+
+**Entity Extraction Examples**:
+```json
+{
+  "original_query": "What was BJP's performance in Maharashtra 2019?",
+  "entities": {
+    "parties": ["BJP"],
+    "constituencies": [],
+    "states": ["Maharashtra"],
+    "years": ["2019"],
+    "candidates": []
+  },
+  "language": "en",
+  "ambiguity_score": 0.1,
+  "requires_clarification": false
+}
+```
 
 **Guardrails Applied**:
 - Input length validation (max 2000 chars)
 - Harmful content detection
 - SQL injection pattern blocking
 - PII redaction for sensitive personal data
+- Language detection for proper routing
+
+**Note**: Intent classification is NOT performed here - it's delegated to the Intent Planning Agent for better separation of concerns.
 
 ---
 
-### 2. Intent Classification Agent
+### 2. Intent Planning Agent (Combined Intent Classification + Planning)
 
-**Purpose**: Route queries to appropriate retrieval strategies
+**Purpose**: Classify query intent AND create execution plan for retrieval
+
+**Why Combined?**: 
+- Eliminates redundant processing between separate intent and planning agents
+- Ensures intent classification directly informs retrieval strategy
+- Reduces latency by performing classification and planning in single step
+- Better alignment between identified intent and execution plan
+
+**Responsibilities**:
+1. **Intent Classification**:
+   - Determine query type (factual, comparative, trend, analytical, sentiment)
+   - Assess complexity level (simple, moderate, complex)
+   - Identify required data sources
+
+2. **Query Decomposition**:
+   - Break complex queries into sub-queries
+   - Identify dependencies between sub-tasks
+   - Determine parallel vs sequential execution
+
+3. **Tool Selection**:
+   - Select appropriate MCP tools (Database, Vector Search, External APIs)
+   - Define tool parameters and filters
+   - Specify expected output format
+
+4. **Strategy Definition**:
+   - Choose retrieval strategy (direct, hybrid, multi-hop)
+   - Set confidence thresholds
+   - Define fallback mechanisms
 
 **Intent Categories**:
-| Intent Type | Description | Example |
-|-------------|-------------|---------|
-| **Factual** | Single fact lookup | "Who won Delhi 2020?" |
-| **Comparative** | Compare entities | "BJP vs Congress in Maharashtra" |
-| **Trend** | Temporal analysis | "Voter turnout trend 2014-2024" |
-| **Analytical** | Complex reasoning | "Why did AAP lose in rural areas?" |
-| **Sentiment** | Opinion/sentiment | "Public perception of Modi" |
+| Intent Type | Description | Example | Retrieval Strategy |
+|-------------|-------------|---------|-------------------|
+| **Factual** | Single fact lookup | "Who won Delhi 2020?" | Direct vector search + exact match |
+| **Comparative** | Compare entities | "BJP vs Congress in Maharashtra" | Multi-query retrieval + comparison |
+| **Trend** | Temporal analysis | "Voter turnout trend 2014-2024" | Time-series SQL + vector context |
+| **Analytical** | Complex reasoning | "Why did AAP lose in rural areas?" | Multi-hop retrieval + CoT reasoning |
+| **Sentiment** | Opinion/sentiment | "Public perception of Modi" | Social media API + sentiment analysis |
+
+**Planning Output Structure**:
+```json
+{
+  "intent": "comparative",
+  "complexity": "moderate",
+  "sub_queries": [
+    {"query": "BJP performance Maharashtra 2019", "tool": "vector_search"},
+    {"query": "Congress performance Maharashtra 2019", "tool": "vector_search"}
+  ],
+  "execution_plan": {
+    "parallel_groups": [["sub_query_1", "sub_query_2"]],
+    "sequential_steps": ["synthesize_comparison"],
+    "dependencies": {"synthesize_comparison": ["sub_query_1", "sub_query_2"]}
+  },
+  "tools_required": ["vector_search", "sql_query"],
+  "confidence_threshold": 0.75,
+  "fallback_strategy": "return_partial_results"
+}
+```
 
 **Decision Logic**:
-- Factual → Direct vector search + exact match
-- Comparative → Multi-query retrieval + comparison synthesis
-- Trend → Time-series SQL aggregation + vector context
-- Analytical → Multi-hop retrieval + chain-of-thought reasoning
+- Factual → Direct retrieval, single tool call, low latency path
+- Comparative → Parallel retrieval for each entity, then synthesis
+- Trend → SQL aggregation with time filters + vector context
+- Analytical → Multi-hop retrieval with iterative refinement
+- Sentiment → External API calls + sentiment scoring
 
 ---
 
@@ -780,15 +849,20 @@ register_tool("youtube_transcript", YouTubeTranscriptTool())
 │ Step 3: Query Analysis Agent                                            │
 │ • Parse: "voter turnout" → metric, "Patna" → constituency,             │
 │          "2020" → year                                                  │
-│ • Intent: FACTUAL (single fact lookup)                                  │
 │ • Entities: {constituency: "Patna", year: 2020, metric: "turnout"}     │
 │ • Guardrails: ✅ Pass (length OK, no harmful content, no PII)          │
 └────────────────────────────────┬────────────────────────────────────────┘
                                  ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
-│ Step 4: Intent Classification Agent                                     │
+│ Step 4: Intent Planning Agent (Classification + Planning)               │
 │ • Classified as: FACTUAL                                                │
-│ • Routing: Direct vector search + exact SQL match                       │
+│ • Complexity: SIMPLE                                                    │
+│ • Execution Plan:                                                       │
+│   - Sub-queries: ["voter turnout Patna 2020"]                          │
+│   - Tools: [vector_search, sql_query]                                  │
+│   - Strategy: Direct retrieval (single step)                           │
+│   - Parallel groups: [] (sequential only)                              │
+│   - Confidence threshold: 0.75                                         │
 └────────────────────────────────┬────────────────────────────────────────┘
                                  ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
@@ -876,19 +950,36 @@ register_tool("youtube_transcript", YouTubeTranscriptTool())
 │   - Topic: "agriculture"                                                │
 │   - Location: "Bihar"                                                   │
 │   - Task: "compare" + "analyze fulfillment"                            │
-│ • Intent: ANALYTICAL (requires multi-step reasoning)                    │
+│ • Entities: {parties: ["Party A", "Party B"], topic: "agriculture",    │
+│              state: "Bihar"}                                            │
 │ • Guardrails: ✅ Pass                                                   │
 └────────────────────────────────┬────────────────────────────────────────┘
                                  ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
-│ Step 4: Intent Classification Agent                                     │
+│ Step 4: Intent Planning Agent (Classification + Planning)               │
 │ • Classified as: ANALYTICAL + COMPARATIVE                               │
-│ • Decision: Requires multi-hop retrieval + tool execution              │
-│ • Plan:                                                                 │
-│   1. Retrieve Party A agriculture promises                              │
-│   2. Retrieve Party B agriculture promises                              │
-│   3. Fetch fulfillment data for both                                    │
-│   4. Synthesize comparison                                              │
+│ • Complexity: COMPLEX                                                   │
+│ • Execution Plan:                                                       │
+│   - Sub-queries: [                                                      │
+│       "Party A agriculture promises Bihar",                            │
+│       "Party B agriculture promises Bihar",                            │
+│       "Party A agriculture fulfillment status",                        │
+│       "Party B agriculture fulfillment status"                         │
+│     ]                                                                   │
+│   - Tools: [vector_search, sql_query, external_api]                    │
+│   - Strategy: Multi-hop retrieval with parallel execution              │
+│   - Parallel groups: [["sub_query_1", "sub_query_2"],                  │
+│                       ["sub_query_3", "sub_query_4"]]                  │
+│   - Sequential steps: ["synthesize_comparison", "analyze_fulfillment"] │
+│   - Dependencies: {                                                     │
+│       "synthesize_comparison": ["sub_query_1", "sub_query_2"],         │
+│       "analyze_fulfillment": ["sub_query_3", "sub_query_4",            │
+│                               "synthesize_comparison"]                 │
+│     }                                                                   │
+│   - Confidence threshold: 0.70 (lower due to complexity)               │
+│   - Fallback: Return partial results if some data unavailable          │
+└────────────────────────────────┬────────────────────────────────────────┘
+                                 ▼
 └────────────────────────────────┬────────────────────────────────────────┘
                                  ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
